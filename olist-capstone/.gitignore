@@ -1,0 +1,15 @@
+# secrets
+.env
+*.pem
+# data (download instructions in README)
+data/olist/*.csv
+data/nyc_taxi/
+data/processed/
+# runtime output
+task3_pipeline/kafka/output/
+__pycache__/
+.ipynb_checkpoints/
+spark-warehouse/
+metastore_db/
+derby.log
+.venv/

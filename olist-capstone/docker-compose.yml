@@ -1,0 +1,159 @@
+# Capstone stack: PostgreSQL + Airflow (ETL) + Kafka/Zookeeper/Kafdrop (streaming)
+#
+#   (create .env from .env.example first)
+#   docker compose up airflow-init
+#   docker compose up -d
+#   docker compose ps
+#
+# UIs:  JupyterLab http://localhost:8888   Airflow http://localhost:8080   Kafdrop http://localhost:9000
+# Postgres is published on localhost:${PG_HOST_PORT:-5432} for the SQL notebook.
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.3-python3.11
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    # Airflow Connection "olist_dw", defined from the environment so no credentials sit in the DAG code
+    AIRFLOW_CONN_OLIST_DW: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/olist
+    OLIST_DATA_DIR: /opt/airflow/data/olist
+    OLIST_STAGING_DIR: /tmp/olist_staging
+  volumes:
+    - ./task3_pipeline/airflow/dags:/opt/airflow/dags
+    - ./data/olist:/opt/airflow/data/olist:ro
+    - airflow-staging:/opt/airflow/data/staging
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: capstone-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: airflow
+    ports:
+      - "${PG_HOST_PORT:-5432}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./task3_pipeline/postgres/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d airflow"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: capstone-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create --role Admin --username "$${AIRFLOW_ADMIN_USER}" --password "$${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname Capstone --lastname Admin --email admin@example.com || true
+    environment:
+      <<: *airflow-common-env
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: capstone-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      retries: 10
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: capstone-airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      retries: 5
+    restart: unless-stopped
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: capstone-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: capstone-kafka
+    depends_on: [zookeeper]
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Two listeners: one for containers (kafka:29092, used by Kafdrop) and one for
+      # Python scripts on the host (localhost:9092). With a single localhost listener,
+      # Kafdrop inside Docker would be told to connect to its own localhost and fail.
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # the producer creates its topic explicitly
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka:29092 > /dev/null 2>&1"]
+      interval: 10s
+      retries: 10
+    restart: unless-stopped
+
+  kafdrop:
+    image: obsidiandynamics/kafdrop:latest
+    container_name: capstone-kafdrop
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "9000:9000"
+    environment:
+      KAFKA_BROKERCONNECT: kafka:29092
+    restart: unless-stopped
+
+  # JupyterLab with Python, Java and PySpark already inside, so nothing needs installing
+  # on the laptop. The whole repo is mounted at /home/jovyan/work.
+  jupyter:
+    image: quay.io/jupyter/pyspark-notebook:latest
+    container_name: capstone-jupyter
+    ports:
+      - "8888:8888"   # JupyterLab
+      - "4040:4040"   # Spark UI (only while a Spark notebook is running)
+    environment:
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN}
+      OLIST_PG_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/olist
+      KAFKA_BOOTSTRAP: kafka:29092
+    volumes:
+      - ./:/home/jovyan/work
+    command: >
+      bash -c "pip install --quiet psycopg2-binary sqlalchemy 'kafka-python>=2.0.3' &&
+               start-notebook.py --ServerApp.root_dir=/home/jovyan/work"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  airflow-logs:
+  airflow-staging:

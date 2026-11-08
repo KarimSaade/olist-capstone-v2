@@ -1,0 +1,7 @@
+pyspark==4.0.1
+pandas>=2.2
+matplotlib>=3.8
+psycopg2-binary>=2.9
+SQLAlchemy>=2.0
+kafka-python>=2.0.3
+jupyterlab>=4.0
